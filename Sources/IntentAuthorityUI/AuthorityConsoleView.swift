@@ -128,7 +128,11 @@ public struct AuthorityConsoleView: View {
                 if !budgetLine.isEmpty {
                     Text(budgetLine)
                         .font(.caption.monospaced())
-                        .foregroundStyle(remainingBudget > 0 ? .secondary : .red)
+                        // Both branches are spelled `Color.` on purpose. A bare
+                        // `.secondary` resolves to `HierarchicalShapeStyle` while
+                        // `.red` resolves to `Color`, and a ternary needs one type —
+                        // so the shorthand form does not compile for iOS.
+                        .foregroundStyle(remainingBudget > 0 ? Color.secondary : Color.red)
                 }
             }
             .padding(.vertical, 2)
