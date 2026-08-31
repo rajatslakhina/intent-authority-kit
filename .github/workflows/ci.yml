@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux — build (warnings as errors) + test
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with warnings as errors
+        # A warning fails the job, so the README's "zero warnings" claim is
+        # machine-enforced rather than asserted in prose.
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test
+
+  apple:
+    name: macOS — build for iOS Simulator
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve package
+        run: xcodebuild -resolvePackageDependencies
+      - name: Build for iOS Simulator
+        # Generic destination on purpose: pinning to a named device ties the job
+        # to whichever simulator runtimes happen to be installed on that day's
+        # runner image, and they are not guaranteed. A compile-only check needs
+        # no device to exist.
+        #
+        # The scheme is read from xcodebuild rather than hardcoded: SwiftPM's
+        # generated scheme name is a build-system detail, not package API.
+        run: |
+          xcodebuild -list
+          SCHEME=$(xcodebuild -list | sed -n '/Schemes:/,$p' | sed -n '2p' | xargs)
+          echo "Building scheme: $SCHEME"
+          xcodebuild build -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator'
