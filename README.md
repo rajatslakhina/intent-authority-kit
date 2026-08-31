@@ -121,6 +121,11 @@ CI runs both jobs on every push: [Actions](https://github.com/rajatslakhina/inte
 
 ## Changelog
 
+**1.1.1** — a compile error in `IntentAuthorityUI` shipped in 1.1.0 with both CI jobs green, and the CI gap that let it through is fixed in the same release.
+
+- `AuthorityConsoleView` used `.foregroundStyle(remainingBudget > 0 ? .secondary : .red)`. A ternary needs one type; bare `.secondary` resolves to `HierarchicalShapeStyle` and bare `.red` to `Color`, so the expression does not compile for iOS. Both branches are now spelled `Color.`.
+- **Why no job caught it.** Linux cannot compile this module at all — it is behind `#if canImport(SwiftUI)` — so `swift build` and `swift test` skipped it silently. The macOS job built only the *first* scheme `xcodebuild -list` reported, which is `IntentAuthority`, not `IntentAuthorityUI`. Two green jobs, and the SwiftUI module had never once been compiled. The macOS job now loops over **every** scheme. The error surfaced in the demo app's CI, which is the only job that had been building the UI module — an accidental but real argument for the two-repo split.
+
 **1.1.0** — an independent review of 1.0.0 found a genuine concurrency defect and several doc claims that outran the code. Fixed:
 
 - **The idempotency key is now claimed before the confirmation `await`, not after.** Two concurrent invocations of the same commit could previously both find the ledger empty, both raise a prompt, and — before a second fix landed — both be admitted. Regression tests for both halves were verified by reverting each fix and watching them fail.
