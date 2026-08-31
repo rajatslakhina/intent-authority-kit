@@ -2,6 +2,8 @@
 
 **Your App Intents surface stopped having users and started having an untrusted LLM planner as a caller. `perform()` receives resolved parameters and nothing about where they came from.**
 
+*(This package is the decision layer for that problem, not an App Intents adapter — see [The integration boundary](#the-integration-boundary--the-part-this-repo-does-not-solve).)*
+
 In iOS 27, Siri decides at runtime which registered intent satisfies a request and chains several together. That makes your intent surface a public API invoked by a caller you do not control, do not authenticate, and cannot patch. [NowSecure's August 2026 teardown](https://www.nowsecure.com/blog/2026/08/05/what-appsec-teams-need-to-know-about-app-intents-siri-ai-and-the-new-ios-27-attack-surface/) names the failure modes: *parameter poisoning* (the recipient field of a transfer is rewritten by injected content), *action poisoning* (the planner is steered to fire `openURL` instead of `summarize`), and the one that makes both worse — the **baton pass**, where one agent hands off to another inside a session and the full transcript, injection included, is inherited downstream. Apple's [WWDC26 session 347, *Secure your app: mitigate risks to agentic features*](https://developer.apple.com/videos/play/wwdc2026/347/), concedes indirect prompt injection is unsolved and pushes threat modelling onto the developer.
 
 *(Both sources are linked because the argument rests on them. Nothing below depends on a claim you cannot check.)*
@@ -35,9 +37,9 @@ So every value carries **two** trust axes:
 
 ## What's in it
 
-Two library products. `IntentAuthority` imports nothing but the standard library, so the entire decision layer is testable on Linux; `IntentAuthorityUI` is the SwiftUI console the demo app renders.
+Two library products. `IntentAuthority` imports no Apple framework — only the standard library, plus `Darwin`/`Glibc` for the `pthread_mutex_t` backing `Mutex` (the iOS 17 floor predates `Synchronization.Mutex`) — so the entire decision layer builds and tests on Linux; `IntentAuthorityUI` is the SwiftUI console the demo app renders.
 
-**The taint model** — `Provenance` is a join-semilattice (`userConfirmed` › `appDerived` › `plannerAuthored` › `contentDerived`), so interpolating an attacker substring into a user-typed template yields a tainted value without any call site having to remember that. `TaintedValue.derived(...)` is the only supported way to build a composite, which makes the safe path the easy one. Commutativity, associativity and idempotence are checked exhaustively, not assumed.
+**The taint model** — `Provenance` is a join-semilattice (`userConfirmed` › `appDerived` › `plannerAuthored` › `contentDerived`), so interpolating an attacker substring into a user-typed template yields a tainted value when built with `TaintedValue.derived(...)`. Be precise about what that does and does not buy: `derived` makes the *safe* path a one-liner, but the memberwise initialiser is public and a caller who hand-writes `.userConfirmed` for an interpolated string will get away with it. There is no `ExpressibleByStringInterpolation` conformance and nothing structural — this is a convention the call site must follow, not an invariant the type system enforces, and calling it enforcement would be the kind of overclaim the rest of this README is trying to avoid. Commutativity, associativity and idempotence are checked exhaustively, not assumed.
 
 **`TaintFloor`** — a monotone high-water mark of what the *session* has been exposed to, inherited across a baton pass. There is no way to lower it. Taint that lived only on individual values would be laundered by the handoff: the downstream agent authors a "fresh" value and it looks clean, because it never touched the poisoned bytes itself.
 
@@ -85,7 +87,7 @@ swift test
 Add it to a project:
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/intent-authority-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/intent-authority-kit.git", from: "1.1.2")
 ```
 
 ```swift
@@ -103,13 +105,31 @@ case .declined, .allowedInert: break
 
 ---
 
+## The integration boundary — the part this repo does NOT solve
+
+**There is no `import AppIntents` anywhere in this package, and that is a real limitation, not an oversight to be discovered in an interview.**
+
+Everything above assumes the host app hands the broker an `IntentInvocation` whose every `TaintedValue` already carries the right `Provenance`. Producing that is the hard, unsolved half of the problem, and it is unsolved here:
+
+- `AppIntent.perform()` receives resolved `@Parameter` values with **no origin metadata**. By the time your code runs, "the user typed this", "this came out of our Core Data store", and "the planner composed this from an email it just read" are the same `String`. The framework does not tell you which, and there is no hook that does.
+- So the mapping has to be reconstructed at the boundary — from your own resolver, your `AppEntity` query, and whatever your agent loop knows about what it fed the planner. That is app-specific, it is where the real bugs will live, and getting it wrong makes everything downstream confidently wrong: a broker that is told an attacker's string is `.userConfirmed` will wave it straight through, and none of the invariants in this repo will notice.
+
+What this package *is*, stated plainly: **the decision layer, in isolation.** Given correct provenance it will not lose it, will not let a suspension point launder it, will bind confirmations to exact values, and will produce a replayable record. Wiring provenance in is left to the host app, deliberately — but pretending that wiring is trivial would be the most misleading thing this README could do.
+
+The demo app is honest about this too: its seven scenarios construct `IntentInvocation`s directly. They are not `AppIntent`s, and nothing in either repo calls a real `perform()`.
+
+---
+
 ## Verification status (honest)
 
 **What was actually run**, on a Linux container with Swift 6.0.3:
 
 - `swift build -Xswiftc -warnings-as-errors` from a clean `.build` — succeeds, zero warnings.
-- `swift test` — **89 tests, 0 failures.** The concurrency tests were re-run five times to check for scheduling flakiness; stable.
-- The concurrency regression test was verified to be non-vacuous by **reverting the fix and watching it fail** with the exact predicted symptom (`the same key was admitted twice`), then restoring it.
+- `swift test` — **100 tests, 0 failures.** The concurrency tests were re-run five times to check for scheduling flakiness; stable.
+- Every regression test in this repo was verified non-vacuous the same way: **revert the fix, watch the test fail with the predicted symptom, restore.** Recorded precisely, because the symptom is not always the obvious one:
+  - *key claimed after the `await`* → `prompts == 1` and `replayed.count == 1` fail. (`admitted.count == 1` still passes, because the ledger's own `record` guard catches the loser — which is why quoting that assertion as the symptom, as an earlier version of this file did, was wrong.)
+  - *floor re-check deleted* → `allowedCommit(...)` instead of `refused(.sessionFloorRaisedDuringConfirmation)`.
+  - *receipt-validation branch deleted* → `allowedCommit(...)` instead of `refused(.receiptValueMismatch)`, and the reservation is not refunded.
 - The digest golden vectors were produced by an **independent** FNV-1a implementation (a Python script following the same encoding), not by freezing this package's own output. A swap to `Hasher` fails them in any process.
 - Both invariant-checker directions are asserted: the real policy passes all nine, `PermissiveAuthorizationPolicy` fails the content-taint invariant, and `SingleAxisAuthorizationPolicy` **passes monotonicity and still fails** the selection-trust invariant — which is why that invariant exists.
 
@@ -121,6 +141,18 @@ CI runs both jobs on every push: [Actions](https://github.com/rajatslakhina/inte
 
 ## Changelog
 
+**1.1.2** — a third independent review found two more holes on the actor boundary, plus a set of claims this file could not back. All fixed and covered:
+
+- **The taint floor was read before the confirmation `await` and never re-read.** A concurrent `noteContentIngested` during a prompt could raise the floor, and the commit was then admitted on a receipt granted for the *weaker* requirement computed under the old floor — defeating the baton-pass case this README leads with, by winning a race. `authorize` now snapshots the floor and refuses with `.sessionFloorRaisedDuringConfirmation` if it moved. Verified non-vacuous.
+- **An empty parameter set was exempt from the floor** on the selection axis, so a parameterless commit — "pay my balance", the most common App Intents shape — ran unprompted in a fully content-exposed session. It now takes `floor.selectionCeiling`. The content axis still returns `.authentic`, which is correct: no bytes really is no attacker bytes. The old behaviour had a test asserting it was intended; that test was wrong and is replaced.
+- **The broker's receipt-validation branch had zero coverage** — every shipped presenter returned `nil` or a correctly-bound receipt, so deleting the branch left all tests green. Added `MisboundReceiptPresenter` and `UndergrantingReceiptPresenter`; both refusals are now asserted through `authorize`, including that the budget and ledger claims are released.
+- **The demo's exposure panel was blank for 5 of 7 rows**, including the baton-pass row it exists to explain, because it only printed a line when a parameter happened to be `contentDerived`. Scenarios now declare `exposedBy`, the console starts them clean and *derives* the floor by replaying real ingestion events, and every row explains its floor.
+- **`IntentAuthorityUI` had no tests at all** and the seven-row table both READMEs print had no regression test. Added `ScenarioCatalogTests`.
+- **The macOS CI job could pass having built nothing** — a `while read` over an empty pipeline exits 0. It now asserts `IntentAuthorityUI` is in the scheme list and that the build counter is non-zero.
+- Added a **"The integration boundary"** section: there is no App Intents code in this package, mapping resolved `@Parameter` values to `Provenance` is the host app's job, and that is the hard half. Removed the claim that the demo has `perform()` bodies — it does not.
+- Corrected: "imports nothing but the standard library" (`Mutex` uses `pthread_mutex_t`); `TaintedValue.derived` described as enforcement when it is a convention; `settle`'s second-settle guard attributed to the ledger when it lives in `BrokerSession`; and the non-vacuity symptom quoted for the concurrency test, which was the wrong assertion.
+- Removed a duplicated doc comment and a dead store in `BrokerSession`.
+
 **1.1.1** — a compile error in `IntentAuthorityUI` shipped in 1.1.0 with both CI jobs green, and the CI gap that let it through is fixed in the same release.
 
 - `AuthorityConsoleView` used `.foregroundStyle(remainingBudget > 0 ? .secondary : .red)`. A ternary needs one type; bare `.secondary` resolves to `HierarchicalShapeStyle` and bare `.red` to `Color`, so the expression does not compile for iOS. Both branches are now spelled `Color.`.
@@ -129,7 +161,7 @@ CI runs both jobs on every push: [Actions](https://github.com/rajatslakhina/inte
 **1.1.0** — an independent review of 1.0.0 found a genuine concurrency defect and several doc claims that outran the code. Fixed:
 
 - **The idempotency key is now claimed before the confirmation `await`, not after.** Two concurrent invocations of the same commit could previously both find the ledger empty, both raise a prompt, and — before a second fix landed — both be admitted. Regression tests for both halves were verified by reverting each fix and watching them fail.
-- `IdempotencyLedger.record` refuses to overwrite a record inside the retry horizon; `settle` refuses a second settle; `rollback` refuses once a commit has settled.
+- `IdempotencyLedger.record` refuses to overwrite a record inside the retry horizon. A second `settle` is refused by `BrokerSession.settle`, which guards on the recorded outcome — the ledger's own `settle` overwrites unconditionally, and the guard is deliberately one layer up where the budget is. `rollback` refuses once a commit has settled.
 - `noteContentIngested(from:)` retains the source (it previously discarded it), bounded and with a truncation flag.
 - `SourceSet` is capped; its equality was aligned with what the parameter digest actually encodes.
 - Removed the unused `RefusalReason.confirmationMissing` and a dead nonce counter.

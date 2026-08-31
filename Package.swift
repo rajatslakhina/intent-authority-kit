@@ -21,9 +21,15 @@ let package = Package(
             dependencies: ["IntentAuthority"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // Depends on BOTH modules on purpose. `IntentAuthorityUI` previously had
+        // no tests on any platform, which meant the seven-row scenario table
+        // both READMEs print could drift from what the policy actually returns
+        // and nothing would notice. `AuthorityScenario` is plain Swift — only
+        // `AuthorityConsoleView` is behind `#if canImport(SwiftUI)` — so the
+        // catalog is testable on Linux too.
         .testTarget(
             name: "IntentAuthorityTests",
-            dependencies: ["IntentAuthority"],
+            dependencies: ["IntentAuthority", "IntentAuthorityUI"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
