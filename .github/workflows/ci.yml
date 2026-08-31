@@ -46,12 +46,28 @@ jobs:
         # only part of this package that Linux cannot compile at all, since it is
         # behind `#if canImport(SwiftUI)`. A type error there shipped in 1.1.0
         # with both CI jobs green. This loop is the fix for that class of miss.
+        #
+        # The loop is guarded, because a `while read` over an empty pipeline
+        # exits 0 and would reproduce the exact green-on-nothing failure this
+        # step exists to fix. `IntentAuthorityUI` must appear in the scheme list
+        # or the job fails before building anything, and the counter must be
+        # non-zero at the end.
+        #
+        # `< /dev/null` on the build: xcodebuild inherits the loop's stdin
+        # otherwise and can eat the remaining scheme names.
         run: |
+          set -euo pipefail
           xcodebuild -list
-          xcodebuild -list | sed -n '/Schemes:/,$p' | tail -n +2 | sed '/^$/d' | while read -r SCHEME; do
-            SCHEME=$(echo "$SCHEME" | xargs)
-            [ -z "$SCHEME" ] && continue
+          SCHEMES=$(xcodebuild -list | sed -n '/Schemes:/,$p' | tail -n +2 | sed '/^$/d' | xargs -n1)
+          echo "Discovered schemes: $SCHEMES"
+          echo "$SCHEMES" | grep -qx 'IntentAuthorityUI' \
+            || { echo "::error::IntentAuthorityUI is not in the scheme list — the SwiftUI module would go unbuilt"; exit 1; }
+          BUILT=0
+          for SCHEME in $SCHEMES; do
             echo "::group::Building scheme $SCHEME"
-            xcodebuild build -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator'
+            xcodebuild build -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator' < /dev/null
             echo "::endgroup::"
+            BUILT=$((BUILT + 1))
           done
+          echo "Built $BUILT scheme(s)."
+          [ "$BUILT" -gt 0 ] || { echo "::error::built nothing"; exit 1; }
