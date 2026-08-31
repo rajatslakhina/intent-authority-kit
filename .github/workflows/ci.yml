@@ -40,8 +40,18 @@ jobs:
         #
         # The scheme is read from xcodebuild rather than hardcoded: SwiftPM's
         # generated scheme name is a build-system detail, not package API.
+        #
+        # EVERY scheme is built, not just the first one. Building only the first
+        # scheme silently skipped IntentAuthorityUI — the SwiftUI module, and the
+        # only part of this package that Linux cannot compile at all, since it is
+        # behind `#if canImport(SwiftUI)`. A type error there shipped in 1.1.0
+        # with both CI jobs green. This loop is the fix for that class of miss.
         run: |
           xcodebuild -list
-          SCHEME=$(xcodebuild -list | sed -n '/Schemes:/,$p' | sed -n '2p' | xargs)
-          echo "Building scheme: $SCHEME"
-          xcodebuild build -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator'
+          xcodebuild -list | sed -n '/Schemes:/,$p' | tail -n +2 | sed '/^$/d' | while read -r SCHEME; do
+            SCHEME=$(echo "$SCHEME" | xargs)
+            [ -z "$SCHEME" ] && continue
+            echo "::group::Building scheme $SCHEME"
+            xcodebuild build -scheme "$SCHEME" -destination 'generic/platform=iOS Simulator'
+            echo "::endgroup::"
+          done
