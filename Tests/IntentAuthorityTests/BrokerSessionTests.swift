@@ -719,3 +719,144 @@ final class SettleIdempotenceTests: XCTestCase {
         XCTAssertEqual(retry.decision, .replayed(.executed))
     }
 }
+
+// MARK: - Coverage added after a third independent review
+
+private func promptedCommit(
+    intent: String = "payments.send",
+    value: String = "Priya Nair",
+    provenance: Provenance = .plannerAuthored,
+    radius: Int = 1
+) -> IntentInvocation {
+    IntentInvocation(
+        descriptor: IntentDescriptor(
+            id: IntentID(intent), tier: .commit, effectSummary: "Send a payment"
+        ),
+        parameters: ParameterSet([
+            TaintedValue(name: "recipient", canonicalValue: value, provenance: provenance)
+        ]),
+        blastRadius: BlastRadius(resolvedCount: radius)
+    )
+}
+
+/// The broker's receipt-validation branch had **zero** coverage: every shipped
+/// presenter returned either `nil` or a correctly-bound receipt, so deleting the
+/// branch outright left the whole suite green. These tests reach it.
+final class ReceiptEnforcementTests: XCTestCase {
+
+    private func session(
+        clock: ManualClock, presenter: any ConfirmationPresenter
+    ) -> BrokerSession {
+        BrokerSession(
+            id: SessionID("s-1"), presenter: presenter, clock: clock,
+            initialFloor: .contentExposed
+        )
+    }
+
+    /// A receipt for a *different* invocation must not admit this one.
+    ///
+    /// **Non-vacuity:** delete the `presented.validate(...)` block in
+    /// `BrokerSession.authorize` and this fails with `.allowedCommit`.
+    func testReceiptBoundToAnotherInvocationIsRefused() async {
+        let clock = ManualClock()
+        let real = promptedCommit(value: "Priya Nair")
+        let swapped = promptedCommit(value: "Mallory Quinn")
+        let s = session(clock: clock, presenter: MisboundReceiptPresenter(clock: clock, substitute: swapped))
+
+        let result = await s.authorize(real)
+        XCTAssertEqual(result.decision, .refused(.receiptValueMismatch))
+
+        // Both claims must be released, or a refused commit still costs budget
+        // and burns the key.
+        let snapshot = await s.budgetSnapshot
+        XCTAssertEqual(snapshot.reserved, 0, "a refused receipt must refund the reservation")
+        let retry = await s.authorize(real)
+        XCTAssertEqual(retry.decision, .refused(.receiptValueMismatch),
+                       "the key must have been discarded, not left in-flight")
+    }
+
+    /// A receipt granting a weaker confirmation than required must not admit.
+    func testUndergrantingReceiptIsRefused() async {
+        let clock = ManualClock()
+        let invocation = promptedCommit(provenance: .contentDerived(SourceSet([SourceID("mail:1")])))
+        // Content-derived commits are refused outright, so use a planner-authored
+        // value under an exposed floor: that requires .verifyValue.
+        let planner = promptedCommit(provenance: .plannerAuthored)
+        _ = invocation
+        let s = session(
+            clock: clock,
+            presenter: UndergrantingReceiptPresenter(clock: clock, grants: .verifyEffect)
+        )
+        let result = await s.authorize(planner)
+        XCTAssertEqual(result.requirement, .verifyValue,
+                       "precondition: this invocation must actually require the stronger prompt")
+        XCTAssertEqual(result.decision, .refused(.receiptInsufficient))
+    }
+}
+
+/// **Regression test for the third reentrancy hole.**
+///
+/// `requirement` is computed against the taint floor as it is at entry, and the
+/// prompt is an `await`. A concurrent `noteContentIngested` can raise the floor
+/// while the prompt is on screen, so the receipt the user hands back was granted
+/// for a question that no longer applies.
+final class FloorRaceTests: XCTestCase {
+
+    /// **Non-vacuity:** delete the `if floor != floorAtEntry` block in
+    /// `BrokerSession.authorize` and this fails with `.allowedCommit` — the
+    /// commit is admitted on a `.verifyEffect` receipt in a session that is by
+    /// then `.contentExposed` and requires `.verifyValue`.
+    func testFloorRaisedDuringThePromptRefusesRatherThanAdmittingOnAStaleReceipt() async {
+        let clock = ManualClock()
+        let presenter = BarrierConfirmationPresenter(clock: clock)
+        // Start clean with an app-derived parameter and a radius above the
+        // confirm threshold: that requires .verifyEffect and parks.
+        let session = BrokerSession(
+            id: SessionID("s-1"),
+            presenter: presenter,
+            clock: clock,
+            limits: AuthorityLimits(blastRadiusConfirmThreshold: 1),
+            initialFloor: .clean
+        )
+        let invocation = promptedCommit(provenance: .appDerived, radius: 12)
+
+        async let admitted = session.authorize(invocation)
+
+        // Wait until the prompt is genuinely parked, then raise the floor from
+        // another task — which is exactly what a tool result arriving mid-prompt
+        // does in a real agent loop.
+        await presenter.waitForArrivals(1)
+        await session.noteContentIngested(from: SourceID("mail:untrusted"))
+        await presenter.release()
+
+        let result = await admitted
+        XCTAssertEqual(result.decision, .refused(.sessionFloorRaisedDuringConfirmation))
+
+        // The audit record must not be self-contradictory: it reports the floor
+        // that now applies, and the trust recomputed under it.
+        XCTAssertEqual(result.floor, .contentExposed)
+        XCTAssertNotEqual(result.trust.selection, .authentic)
+
+        // Both claims released, so a re-ask under the new floor is possible.
+        let snapshot = await session.budgetSnapshot
+        XCTAssertEqual(snapshot.reserved, 0)
+    }
+
+    /// The guard must not fire when nothing raised the floor, or every prompted
+    /// commit would refuse and the test above would pass for the wrong reason.
+    func testAnUndisturbedPromptStillAdmits() async {
+        let clock = ManualClock()
+        let session = BrokerSession(
+            id: SessionID("s-1"),
+            presenter: AlwaysApprovePresenter(clock: clock),
+            clock: clock,
+            limits: AuthorityLimits(blastRadiusConfirmThreshold: 1),
+            initialFloor: .clean
+        )
+        let result = await session.authorize(promptedCommit(provenance: .appDerived, radius: 12))
+        guard case .allowedCommit = result.decision else {
+            return XCTFail("expected admission, got \(result.decision)")
+        }
+        XCTAssertEqual(result.requirement, .verifyEffect)
+    }
+}

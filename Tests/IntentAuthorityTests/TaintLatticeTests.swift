@@ -115,10 +115,53 @@ final class TaintLatticeTests: XCTestCase {
         XCTAssertEqual(ParameterSet([a, b]), ParameterSet([b, a]))
     }
 
-    func testEmptyParameterSetCarriesNoTaint() {
+    /// The two axes deliberately disagree about an empty parameter set, and this
+    /// test exists to pin that disagreement down.
+    ///
+    /// A parameterless intent has no bytes, so there is nothing to distrust on
+    /// the content axis. But it is pure planner choice, so on the selection axis
+    /// it takes the floor's ceiling like anything else that a human did not
+    /// choose. An earlier version of this test asserted `.authentic` on *both*
+    /// axes and passed against an implementation that let "pay my balance" run
+    /// unprompted in a content-exposed session.
+    func testEmptyParameterSetIsCleanOnContentButNotExemptFromTheFloor() {
         let empty = ParameterSet([])
+
         XCTAssertEqual(empty.contentTrust, .authentic)
-        XCTAssertEqual(empty.selectionTrust(under: .contentExposed), .authentic)
+
+        // Clean session: nothing has steered the planner, so nothing to flag.
+        XCTAssertEqual(empty.selectionTrust(under: .clean), .authentic)
+
+        // Exposed session: the *decision to invoke at all* is what may have been
+        // steered, and there are no parameters to make that visible.
+        XCTAssertEqual(empty.selectionTrust(under: .plannerOnly), TaintFloor.plannerOnly.selectionCeiling)
+        XCTAssertEqual(empty.selectionTrust(under: .contentExposed), TaintFloor.contentExposed.selectionCeiling)
+        XCTAssertNotEqual(empty.selectionTrust(under: .contentExposed), .authentic)
+    }
+
+    /// The end-to-end consequence of the above: a parameterless commit in an
+    /// exposed session must not be waved through.
+    ///
+    /// This is the assertion that would have failed against the old behaviour.
+    func testParameterlessCommitIsNotWavedThroughInAnExposedSession() {
+        let policy = DefaultAuthorizationPolicy()
+        let invocation = IntentInvocation(
+            descriptor: IntentDescriptor(
+                id: IntentID("account.payBalance"),
+                tier: .commit,
+                effectSummary: "Pay the full statement balance"
+            ),
+            parameters: ParameterSet([]),
+            blastRadius: BlastRadius(resolvedCount: 1)
+        )
+        let requirement = policy.requirement(
+            for: invocation,
+            floor: .contentExposed,
+            remainingCommitBudget: 10,
+            limits: AuthorityLimits()
+        )
+        XCTAssertNotEqual(requirement, ConfirmationRequirement.none,
+                          "A parameterless commit in a content-exposed session must still be gated.")
     }
 
     func testUntrustedNamesReportsNamesNotValues() {
