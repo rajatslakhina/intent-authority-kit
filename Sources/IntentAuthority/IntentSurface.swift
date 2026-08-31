@@ -59,21 +59,44 @@ public struct ParameterSet: Sendable, Hashable {
 
     public var isEmpty: Bool { values.isEmpty }
 
-    /// The join of every parameter's provenance. An empty set is `userConfirmed`
-    /// — an intent with no parameters carries no taint of its own.
+    /// The join of every parameter's provenance. An empty set joins to
+    /// `userConfirmed`, the lattice identity — but note that
+    /// `selectionTrust(under:)` does *not* read this: an empty set is still
+    /// subject to the session floor. See that method for why.
     public var aggregateProvenance: Provenance {
         Provenance.combining(values.map(\.provenance))
     }
 
     /// The weakest content trust across all parameters.
+    ///
+    /// An empty set is `.authentic`, and that default is correct on this axis:
+    /// no bytes really does mean no attacker-authored bytes.
     public var contentTrust: ContentTrust {
         values.map(\.provenance.contentTrust).min() ?? .authentic
     }
 
     /// The weakest selection trust across all parameters, under a session floor.
+    ///
+    /// **An empty set is not exempt from the floor.** It takes
+    /// `floor.selectionCeiling`, the same ceiling every non-`userConfirmed`
+    /// parameter takes.
+    ///
+    /// This is the opposite of the content axis above, and the asymmetry is the
+    /// whole point of having two axes. A parameterless intent — "pay my
+    /// balance", "clear my inbox", "unlock the door", which is the most common
+    /// shape in App Intents — has no bytes to distrust, but it is *pure planner
+    /// choice*: nothing about it was decided by a human, and after the session
+    /// has read attacker-controlled content, the decision to invoke it at all is
+    /// exactly what may have been steered. Returning `.authentic` here would
+    /// hand the planner the `.userConfirmed` exemption without anyone having
+    /// confirmed anything, and would silently wave through the single case this
+    /// library exists to catch.
+    ///
+    /// An earlier version returned `.authentic` and a test asserted it as
+    /// intended; both were wrong.
     public func selectionTrust(under floor: TaintFloor) -> SelectionTrust {
         values.map { IntentAuthority.selectionTrust(for: $0.provenance, under: floor) }.min()
-            ?? .authentic
+            ?? floor.selectionCeiling
     }
 
     public func effectiveTrust(under floor: TaintFloor) -> EffectiveTrust {

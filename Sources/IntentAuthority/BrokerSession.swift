@@ -212,19 +212,30 @@ public actor BrokerSession {
 
         // ---- The reentrancy-critical region ----
         //
-        // Two things must be claimed before the suspension point, for the same
-        // reason: everything read before `await` may be stale after it, and a
-        // second invocation can enter while this one is parked in a prompt.
+        // Three things read before the suspension point can go stale across it,
+        // because a prompt is an `await` and this actor accepts other work while
+        // one is parked. Two are handled by *claiming* them here; the third
+        // cannot be claimed, so it is snapshotted and re-checked afterwards.
         //
-        //   1. the commit budget, or N concurrent invocations all price
-        //      themselves against the same pre-award balance; and
-        //   2. the idempotency key, or N invocations of the *same* commit each
-        //      raise their own prompt for one admission.
+        //   1. the commit budget — claimed, or N concurrent invocations all
+        //      price themselves against the same pre-award balance;
+        //   2. the idempotency key — claimed, or N invocations of the *same*
+        //      commit each raise their own prompt for one admission; and
+        //   3. the session taint floor — NOT claimable, because raising it is
+        //      exactly what a concurrent `noteContentIngested` is entitled to
+        //      do while this prompt is up. `requirement` was computed against
+        //      the floor as it was at entry; if the floor rises during the
+        //      prompt, that requirement is now too weak and the receipt the
+        //      user is about to hand back was granted for the wrong question.
+        //      See `floorAtEntry` below.
         //
         // Claiming only the budget — which is what this code did until an
         // independent review pointed at the asymmetry — closes the first and
         // leaves the second open, and prompt amplification is precisely the
         // fatigue vector that makes per-action approval stop being a control.
+        // A second review pointed at the third: the floor was read, never
+        // re-read, and the baton-pass scenario the README leads with could be
+        // defeated by winning a race against the prompt.
         var didReserve = false
         if admissionOrder == .reserveBeforeConfirmation {
             guard budget.reserve() else {
@@ -246,10 +257,15 @@ public actor BrokerSession {
             idempotency.discard(key)
         }
 
+        // Snapshot the floor the requirement was computed against. Compared, not
+        // trusted, once the prompt returns.
+        let floorAtEntry = floor
+
         var receipt: ConfirmationReceipt?
         if requirement != .none {
             // SUSPENSION POINT. Everything read before this line may be stale
-            // after it; the two things that matter are already claimed above.
+            // after it: the budget and the key are claimed above, and the floor
+            // is compared against `floorAtEntry` below.
             receipt = await presenter.confirm(
                 invocation: invocation, requirement: requirement, sessionID: id
             )
@@ -273,6 +289,28 @@ public actor BrokerSession {
                 releaseClaims()
                 return refuse(reason, clock.now, invocation, requirement, trust, digest)
             }
+
+            // The floor is monotone, so `floor != floorAtEntry` means it rose.
+            // The receipt in hand was granted against a requirement computed
+            // under a *lower* floor and cannot be upgraded after the fact — the
+            // user answered a weaker question than the one now being asked. The
+            // honest move is to refuse and let the caller re-ask under the new
+            // floor, which is what a retry will do.
+            //
+            // Recomputing the requirement here instead would be worse: it would
+            // admit on a receipt bound to the old requirement, which is the exact
+            // stale-authority bug `ConfirmationReceipt` exists to prevent.
+            if floor != floorAtEntry {
+                releaseClaims()
+                return refuse(
+                    .sessionFloorRaisedDuringConfirmation,
+                    clock.now, invocation, requirement,
+                    // Report the trust as it is *now*, so the audit record is
+                    // internally consistent with the floor it also carries.
+                    invocation.parameters.effectiveTrust(under: floor),
+                    digest
+                )
+            }
         }
 
         if admissionOrder == .reserveAfterConfirmation {
@@ -280,21 +318,18 @@ public actor BrokerSession {
                 idempotency.discard(key)
                 return refuse(.commitBudgetExhausted, clock.now, invocation, requirement, trust, digest)
             }
-            didReserve = true
+            // Deliberately not `didReserve = true`: nothing below this line
+            // releases claims, so the flag would be a dead store.
         }
 
-        let settleTime = clock.now
+        let admittedAt = clock.now
         let decision = BrokerDecision.allowedCommit(key)
-        record(settleTime, invocation, requirement, decision, trust, digest)
+        record(admittedAt, invocation, requirement, decision, trust, digest)
         return AuthorizationResult(
             decision: decision, requirement: requirement, trust: trust, floor: floor
         )
     }
 
-    /// Reports the outcome of an admitted commit.
-    ///
-    /// Returns `false` if the key was never admitted, which is a caller bug the
-    /// broker refuses to paper over.
     /// Reports the outcome of an admitted commit.
     ///
     /// Returns `false` if the key was never admitted, which is a caller bug the

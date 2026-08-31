@@ -27,6 +27,14 @@ public enum RefusalReason: String, Sendable, Hashable, CaseIterable {
     case receiptExpired
     /// A receipt was presented that belongs to a different session.
     case receiptSessionMismatch
+    /// The session taint floor rose while the confirmation prompt was on screen.
+    ///
+    /// The user answered a question computed under the *old* floor. That answer
+    /// cannot be upgraded after the fact — the receipt is bound to the weaker
+    /// requirement — so the commit is refused and the caller must re-ask under
+    /// the floor that now applies. This is the only refusal reason produced by a
+    /// race rather than by the invocation itself.
+    case sessionFloorRaisedDuringConfirmation
 }
 
 /// What the user must be asked before a commit proceeds.

@@ -84,6 +84,65 @@ public struct AlwaysDeclinePresenter: ConfirmationPresenter {
     ) async -> ConfirmationReceipt? { nil }
 }
 
+/// Returns a receipt bound to a *different* invocation than the one being
+/// authorized.
+///
+/// This models the attack the parameter digest exists to stop: a confirmation
+/// obtained for "send £5 to Alice" being replayed against "send £5000 to Mallory".
+/// It exists because without it, `BrokerSession`'s receipt-validation branch was
+/// unreachable in the whole test suite — every shipped presenter returned either
+/// `nil` or a correctly-bound receipt, so deleting the branch outright left all
+/// tests green. A fault injector that can only produce valid output is not a
+/// fault injector.
+public struct MisboundReceiptPresenter: ConfirmationPresenter {
+    private let clock: AuthorityClock
+    private let substitute: IntentInvocation
+
+    /// - Parameter substitute: the invocation the receipt will actually be bound
+    ///   to, which must differ from the one presented for it to be a fault.
+    public init(clock: AuthorityClock, substitute: IntentInvocation) {
+        self.clock = clock
+        self.substitute = substitute
+    }
+
+    public func confirm(
+        invocation: IntentInvocation,
+        requirement: ConfirmationRequirement,
+        sessionID: SessionID
+    ) async -> ConfirmationReceipt? {
+        // Note it grants exactly what was asked for and is issued now, in this
+        // session: the *only* thing wrong with it is the digest. Anything else
+        // would let the test pass for the wrong reason.
+        ReceiptIssuer(clock: clock).issue(
+            sessionID: sessionID, invocation: substitute, granted: requirement, nonce: 0
+        )
+    }
+}
+
+/// Returns a receipt that grants strictly less than was required.
+///
+/// A user who answered "are you sure?" has not answered "which one?", and a
+/// receipt cannot be promoted after the fact.
+public struct UndergrantingReceiptPresenter: ConfirmationPresenter {
+    private let clock: AuthorityClock
+    private let grants: ConfirmationRequirement
+
+    public init(clock: AuthorityClock, grants: ConfirmationRequirement) {
+        self.clock = clock
+        self.grants = grants
+    }
+
+    public func confirm(
+        invocation: IntentInvocation,
+        requirement: ConfirmationRequirement,
+        sessionID: SessionID
+    ) async -> ConfirmationReceipt? {
+        ReceiptIssuer(clock: clock).issue(
+            sessionID: sessionID, invocation: invocation, granted: grants, nonce: 0
+        )
+    }
+}
+
 /// A presenter whose first `confirm` parks until released.
 ///
 /// This is the concurrent writer that makes the reentrancy test real: without
