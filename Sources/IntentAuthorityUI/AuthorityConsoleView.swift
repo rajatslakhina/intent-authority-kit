@@ -46,7 +46,17 @@ public struct AuthorityConsoleView: View {
     @State private var drainLog: [String] = []
     @State private var remainingBudget: Int
     @State private var isRunning = false
-    @State private var auditFindings: [AuditFinding] = []
+
+    /// Deliberately `let`, not `@State`.
+    ///
+    /// It never changes after construction, and SwiftUI re-creates the `View`
+    /// struct on every invalidation — so as `@State` this would re-run
+    /// `AuthorityAudit.verify()` (343 associativity triples plus a radius sweep)
+    /// on every re-render and throw the result away each time, because
+    /// `State(initialValue:)` only takes effect on the first construction. That
+    /// is the classic `State(initialValue:)` trap, and it is worth not falling
+    /// into it in the one SwiftUI file here.
+    private let auditFindings: [AuditFinding]
 
     /// The host app supplies the limits and the policy. They are compiled into
     /// the app on purpose: a single mis-published remote config field should not
@@ -79,7 +89,7 @@ public struct AuthorityConsoleView: View {
             )
         }
         _verdicts = State(initialValue: initial)
-        _auditFindings = State(initialValue: AuthorityAudit.verify(policy: policy, limits: limits))
+        auditFindings = AuthorityAudit.verify(policy: policy, limits: limits)
     }
 
     public var body: some View {
@@ -285,24 +295,27 @@ public struct AuthorityConsoleView: View {
                 // One session per scenario, on purpose: the taint floor is
                 // monotone, so a shared session could not start one scenario
                 // clean after another had gone content-exposed.
+                //
+                // Scenarios that declare `exposedBy` start **clean** and are
+                // raised by replaying real `noteContentIngested(from:)` calls,
+                // so the floor the row displays is one the broker derived, not
+                // one the demo asserted. The `precondition`-style check below
+                // fails loudly if the two ever disagree.
+                let startingFloor: TaintFloor = scenario.exposedBy.isEmpty
+                    ? scenario.floor
+                    : .clean
                 let session = BrokerSession(
                     id: SessionID("demo-\(scenario.id)"),
                     policy: policy,
                     presenter: presenter,
                     clock: clock,
                     limits: limits,
-                    initialFloor: scenario.floor
+                    initialFloor: startingFloor
                 )
-                // Register the exposure that produced this floor, so the
-                // ingested-source list is populated from a real event rather
-                // than being retained state nothing ever reads.
-                for value in scenario.invocation.parameters.values {
-                    if case let .contentDerived(sources) = value.provenance {
-                        for source in sources.sources {
-                            await session.noteContentIngested(from: source)
-                        }
-                    }
+                for source in scenario.exposedBy {
+                    await session.noteContentIngested(from: source)
                 }
+                let derivedFloor = await session.currentFloor
                 let result = await session.authorize(scenario.invocation)
                 updated[scenario.id] = ScenarioVerdict(
                     requirement: result.requirement,
@@ -310,13 +323,22 @@ public struct AuthorityConsoleView: View {
                     decision: result.decision
                 )
                 records.append(contentsOf: await session.auditRecords)
-                let sources = await session.ingestedSources
-                if !sources.isEmpty {
-                    exposures.append(
-                        "\(scenario.invocation.descriptor.id.rawValue): floor raised by "
-                        + sources.map(\.rawValue).joined(separator: ", ")
-                    )
+
+                // Every scenario contributes a line, including the clean ones.
+                // A panel that is blank for the rows it exists to explain is
+                // worse than no panel.
+                let ingested = await session.ingestedSources
+                var line = "\(scenario.title) [\(scenario.id)] — \(scenario.floorOrigin)"
+                if derivedFloor != scenario.floor {
+                    // Not reachable with the shipped catalog; shown rather than
+                    // swallowed, because a demo that quietly disagrees with
+                    // itself is exactly the thing this library is about.
+                    line += "  ⚠︎ declared \(scenario.floor) but derived \(derivedFloor)"
                 }
+                if !scenario.exposedBy.isEmpty && ingested.isEmpty {
+                    line += "  ⚠︎ exposure declared but no source was retained"
+                }
+                exposures.append(line)
                 dropped = Saturating.adding(dropped, await session.auditDroppedCount)
                 clock.advance(bySeconds: 1)
             }

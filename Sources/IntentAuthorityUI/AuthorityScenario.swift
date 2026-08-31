@@ -21,12 +21,44 @@ public struct AuthorityScenario: Sendable, Identifiable, Hashable {
     public let floor: TaintFloor
     public let invocation: IntentInvocation
 
+    /// The sources whose ingestion put this session at `.contentExposed`.
+    ///
+    /// The console does not set the floor directly for these scenarios — it
+    /// starts the session `.clean` and replays these as real
+    /// `noteContentIngested(from:)` calls, so the floor shown is one the broker
+    /// actually derived rather than one the demo asserted. Empty for scenarios
+    /// whose floor has a different origin; see `floorOrigin`.
+    public let exposedBy: [SourceID]
+
+    /// One line explaining what put this session at `floor`, in English.
+    ///
+    /// Every scenario has one, including the `.clean` ones. An earlier version
+    /// showed an "exposure" line only for scenarios that happened to carry a
+    /// `contentDerived` parameter, which left the panel blank for 5 of 7 rows —
+    /// including the baton-pass row, the one the panel exists to explain, whose
+    /// whole point is that the floor is high while the parameter is clean.
+    public var floorOrigin: String {
+        if !exposedBy.isEmpty {
+            return "raised to contentExposed by ingesting "
+                + exposedBy.map(\.rawValue).joined(separator: ", ")
+        }
+        switch floor {
+        case .clean:
+            return "clean — nothing untrusted has entered this session"
+        case .plannerOnly:
+            return "plannerOnly — the planner composed a value, but no untrusted content was read"
+        case .contentExposed:
+            return "contentExposed"
+        }
+    }
+
     public init(
         id: String,
         title: String,
         request: String,
         note: String,
         floor: TaintFloor,
+        exposedBy: [SourceID] = [],
         invocation: IntentInvocation
     ) {
         self.id = id
@@ -34,6 +66,7 @@ public struct AuthorityScenario: Sendable, Identifiable, Hashable {
         self.request = request
         self.note = note
         self.floor = floor
+        self.exposedBy = exposedBy
         self.invocation = invocation
     }
 }
@@ -93,6 +126,7 @@ public extension AuthorityScenario {
             request: "Pay the invoice in that message",
             note: "The confirmation prompt would render the attacker's string. Refuse — you cannot confirm your way out of this one.",
             floor: .contentExposed,
+            exposedBy: [SourceID("mail:msg-8841 (untrusted sender)")],
             invocation: makeInvocation(
                 intent: "payments.send", tier: .commit,
                 summary: "Send a payment", radius: 1,
@@ -112,6 +146,7 @@ public extension AuthorityScenario {
             request: "Archive the thread from Priya",
             note: "Authentic bytes from our database — but the session read untrusted content, so the *choice* is attacker-influenced. This is the case a single-axis model waves through.",
             floor: .contentExposed,
+            exposedBy: [SourceID("calendar:invite-204 (external organiser)")],
             invocation: makeInvocation(
                 intent: "mail.archive", tier: .commit,
                 summary: "Archive a conversation", radius: 1,
@@ -154,6 +189,7 @@ public extension AuthorityScenario {
             request: "Summarise that message",
             note: "Reads are inert and always allowed — but recorded, because the result leaves through the planner and the audit trail is the only place that exposure is reconstructable.",
             floor: .contentExposed,
+            exposedBy: [SourceID("web:support-article-77 (fetched page)")],
             invocation: makeInvocation(
                 intent: "mail.summarise", tier: .read,
                 summary: "Summarise a conversation", radius: 1,
